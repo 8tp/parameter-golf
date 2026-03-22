@@ -2,18 +2,20 @@
 Parameter Golf - Competitive Transformer Training Script
 Incorporates all winning techniques from top leaderboard entries.
 
-Key techniques from SOTA (1.1428 BPB):
-- 10 standard transformer layers (depth recurrence optional)
+Frontier techniques (targeting sub-1.13 BPB):
+- 11 transformer layers (top entries moved from 10→11)
 - BigramHash(10240) bigram embedding table
 - SmearGate per-dimension blending with previous token
 - Mixed int5/int6 quantization (int5 MLP, int6 attention)
 - STE Quantization-Aware Training
-- Stochastic Weight Averaging (SWA) from last 40% of warmdown
+- EMA (exponential moving average, decay 0.997) replacing SWA
 - Muon optimizer with WD=0.04, momentum warmup 0.92->0.99
 - Orthogonal init with muP-scaled output projections
 - 3% magnitude pruning post-training
 - relu^2 MLP at 3x expansion
 - U-net skip connections
+- Partial RoPE (25% of head dims) for position-free attention
+- LN Scale (1/sqrt(layer+1)) for deeper stability
 - zstd-22 compression
 - Sliding window evaluation (stride=64)
 - FP16 tied embeddings passthrough
@@ -73,9 +75,9 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 0.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape — standard 10-layer (matching SOTA)
+    # Model shape — 11 layers (frontier entries use 11L)
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -83,6 +85,12 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Partial RoPE: apply RoPE to only a fraction of head dims (rest is position-free)
+    rope_frac = float(os.environ.get("ROPE_FRAC", 0.25))  # 25% = 16/64 dims
+
+    # LN Scale: damp deeper layers by 1/sqrt(layer_idx+1)
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
 
     # BigramHash embedding
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 10240))
@@ -115,10 +123,10 @@ class Hyperparameters:
     quant_mlp_bits = int(os.environ.get("QUANT_MLP_BITS", 5))
     quant_attn_bits = int(os.environ.get("QUANT_ATTN_BITS", 6))
 
-    # SWA (Stochastic Weight Averaging)
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))  # start SWA at last 40% of warmdown
-    swa_every = int(os.environ.get("SWA_EVERY", 50))  # collect checkpoint every N steps
+    # EMA (Exponential Moving Average) - replaces SWA for better short-run performance
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.1))  # start EMA at 10% of training
 
     # Magnitude pruning
     prune_fraction = float(os.environ.get("PRUNE_FRACTION", 0.03))  # 3% pruning
@@ -758,6 +766,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_frac: float = 0.25,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -769,6 +778,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        # Partial RoPE: only apply to a fraction of head dims
+        self.rope_dims = max(2, 2 * round(self.head_dim * rope_frac / 2))  # must be even
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -776,7 +787,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -788,9 +799,15 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+        # Partial RoPE: only rotate first rope_dims dimensions, rest is position-free
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        rd = self.rope_dims
+        q_rope, q_pass = q[..., :rd], q[..., rd:]
+        k_rope, k_pass = k[..., :rd], k[..., rd:]
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)
+        q = torch.cat([q_rope, q_pass], dim=-1)
+        k = torch.cat([k_rope, k_pass], dim=-1)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         # GQA: expand KV heads for older PyTorch that lacks enable_gqa
         if self.num_kv_heads != self.num_heads:
@@ -830,12 +847,17 @@ class Block(nn.Module):
         mlp_hidden: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_frac: float = 0.25,
+        layer_idx: int = 0,
+        ln_scale: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_frac)
         self.mlp = MLP(dim, mlp_hidden)
+        # LN Scale: damp deeper layers by 1/sqrt(layer_idx+1)
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(
         self,
@@ -848,8 +870,8 @@ class Block(nn.Module):
         mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.ln_scale_factor * attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.ln_scale_factor * mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -873,6 +895,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_hash_buckets: int,
         bigram_hash_dim: int,
+        rope_frac: float = 0.25,
+        ln_scale: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -893,8 +917,9 @@ class GPT(nn.Module):
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_hidden, rope_base, qk_gain_init)
-            for _ in range(num_layers)
+            Block(model_dim, num_heads, num_kv_heads, mlp_hidden, rope_base, qk_gain_init,
+                  rope_frac=rope_frac, layer_idx=i, ln_scale=ln_scale)
+            for i in range(num_layers)
         ])
 
         # Per-layer control parameters
@@ -1124,6 +1149,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_hash_buckets=args.bigram_hash_buckets,
         bigram_hash_dim=args.bigram_hash_dim,
+        rope_frac=args.rope_frac,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1192,7 +1219,8 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:{sdp_mode}")
     log0(f"quant: MLP=int{args.quant_mlp_bits} attn=int{args.quant_attn_bits}")
-    log0(f"swa: enabled={args.swa_enabled} start_frac={args.swa_start_frac} every={args.swa_every}")
+    log0(f"ema: enabled={args.ema_enabled} decay={args.ema_decay} start_frac={args.ema_start_frac}")
+    log0(f"partial_rope: frac={args.rope_frac} ln_scale={args.ln_scale}")
     log0(f"muon_wd:{args.muon_weight_decay} prune_fraction:{args.prune_fraction}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1263,10 +1291,10 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # SWA state
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-    swa_started = False
+    # EMA state
+    ema_state: dict[str, Tensor] | None = None
+    ema_started = False
+    ema_start_step = int(args.iterations * args.ema_start_frac) if args.ema_enabled else args.iterations + 1
 
     # Main training loop
     training_time_ms = 0.0
@@ -1312,21 +1340,17 @@ def main() -> None:
                 _qat_active = True
                 log0(f"QAT activated at step {step} (MLP=int{args.quant_mlp_bits}, attn=int{args.quant_attn_bits})")
 
-        # SWA: accumulate checkpoints during warmdown
-        if args.swa_enabled and is_in_warmdown(step, elapsed_ms):
-            warmdown_frac = 1.0 - scale  # 0 at start of warmdown, 1 at end
-            if warmdown_frac >= args.swa_start_frac and step % args.swa_every == 0:
-                if not swa_started:
-                    swa_started = True
-                    log0(f"SWA started at step {step}")
-                sd = base_model.state_dict()
-                if swa_state is None:
-                    swa_state = {k: v.detach().cpu().float().clone() for k, v in sd.items()}
-                    swa_count = 1
-                else:
-                    for k, v in sd.items():
-                        swa_state[k] += v.detach().cpu().float()
-                    swa_count += 1
+        # EMA: exponential moving average of weights
+        if args.ema_enabled and step >= ema_start_step:
+            sd = base_model.state_dict()
+            if not ema_started:
+                ema_started = True
+                ema_state = {k: v.detach().cpu().float().clone() for k, v in sd.items()}
+                log0(f"EMA started at step {step} (decay={args.ema_decay})")
+            else:
+                decay = args.ema_decay
+                for k, v in sd.items():
+                    ema_state[k].mul_(decay).add_(v.detach().cpu().float(), alpha=1.0 - decay)
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1380,20 +1404,19 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if we collected checkpoints
-    if swa_state is not None and swa_count > 1:
-        log0(f"Applying SWA: averaged {swa_count} checkpoints")
-        for k in swa_state:
-            swa_state[k] /= swa_count
-            swa_state[k] = swa_state[k].to(dtype=base_model.state_dict()[k].dtype)
-        base_model.load_state_dict(swa_state, strict=True)
-        # Re-evaluate after SWA
+    # Apply EMA weights if available
+    if ema_state is not None:
+        log0("Applying EMA weights")
+        for k in ema_state:
+            ema_state[k] = ema_state[k].to(dtype=base_model.state_dict()[k].dtype)
+        base_model.load_state_dict(ema_state, strict=True)
+        # Re-evaluate after EMA
         torch.cuda.synchronize()
         val_loss, val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
-        log0(f"post_swa val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
+        log0(f"post_ema val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
 
     # Magnitude pruning
     if args.prune_fraction > 0:
