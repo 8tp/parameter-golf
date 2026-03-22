@@ -3,10 +3,10 @@
 # Target: sub-1.13 BPB on FineWeb validation
 # Budget: ~$3.59 per 10-minute run ($25 total credits)
 #
-# Architecture: 11-layer transformer + BigramHash + SmearGate
+# Architecture: 10-layer transformer + BigramHash + SmearGate
 # Frontier techniques: Partial RoPE, LN Scale, EMA, mixed int5/int6
 
-export NUM_LAYERS=11
+export NUM_LAYERS=10
 export MODEL_DIM=512
 export NUM_HEADS=8
 export NUM_KV_HEADS=4
@@ -40,9 +40,9 @@ export MUON_MOMENTUM_WARMUP_STEPS=1500
 export MUON_WEIGHT_DECAY=0.04
 export GRAD_CLIP_NORM=0.3
 
-# QAT
+# QAT (start at 30% — wallclock caps at ~9200 steps, not 20000)
 export QAT_ENABLED=1
-export QAT_START_FRAC=0.5
+export QAT_START_FRAC=0.3
 
 # Mixed quantization
 export QUANT_MLP_BITS=5
@@ -55,7 +55,7 @@ export EMA_START_FRAC=0.1
 export EMA_EVERY=10
 
 # Pruning
-export PRUNE_FRACTION=0.03
+export PRUNE_FRACTION=0.05
 
 # Evaluation
 export VAL_STRIDE=64
