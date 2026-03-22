@@ -127,6 +127,7 @@ class Hyperparameters:
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ema_start_frac = float(os.environ.get("EMA_START_FRAC", 0.1))  # start EMA at 10% of training
+    ema_every = int(os.environ.get("EMA_EVERY", 10))  # update EMA every N steps to reduce overhead
 
     # Magnitude pruning
     prune_fraction = float(os.environ.get("PRUNE_FRACTION", 0.03))  # 3% pruning
@@ -277,7 +278,8 @@ def eval_val(
     rank_starts = starts[rank::world_size]
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_loss_token_count = torch.zeros((), device=device, dtype=torch.float64)  # full seq tokens for loss avg
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)  # scored (stride) tokens for BPB
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
@@ -296,8 +298,12 @@ def eval_val(
             score_start = seq_len - stride
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
+            # Loss is mean over full seq_len; weight by full token count for proper averaging
             val_loss_sum += batch_loss.to(torch.float64) * float(y.numel())
-            val_token_count += float(y.numel())
+            val_loss_token_count += float(y.numel())
+            # BPB counts only the scored (stride) tokens
+            scored_tokens = float(y[:, score_start:].numel())
+            val_token_count += scored_tokens
             prev_ids = x[:, score_start:].reshape(-1)
             tgt_ids = y[:, score_start:].reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
@@ -306,10 +312,11 @@ def eval_val(
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_loss_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = val_loss_sum / val_token_count
+    val_loss = val_loss_sum / val_loss_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     model.train()
     return float(val_loss.item()), float(bits_per_token * (val_token_count.item() / val_byte_count.item()))
@@ -1340,15 +1347,16 @@ def main() -> None:
                 _qat_active = True
                 log0(f"QAT activated at step {step} (MLP=int{args.quant_mlp_bits}, attn=int{args.quant_attn_bits})")
 
-        # EMA: exponential moving average of weights
-        if args.ema_enabled and step >= ema_start_step:
+        # EMA: exponential moving average of weights (updated every ema_every steps)
+        if args.ema_enabled and step >= ema_start_step and step % args.ema_every == 0:
             sd = base_model.state_dict()
             if not ema_started:
                 ema_started = True
                 ema_state = {k: v.detach().cpu().float().clone() for k, v in sd.items()}
-                log0(f"EMA started at step {step} (decay={args.ema_decay})")
+                log0(f"EMA started at step {step} (decay={args.ema_decay} every={args.ema_every})")
             else:
-                decay = args.ema_decay
+                # Effective decay for N-step gap: decay^N
+                decay = args.ema_decay ** args.ema_every
                 for k, v in sd.items():
                     ema_state[k].mul_(decay).add_(v.detach().cpu().float(), alpha=1.0 - decay)
 

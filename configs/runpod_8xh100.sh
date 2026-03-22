@@ -52,6 +52,7 @@ export QUANT_ATTN_BITS=6
 export EMA_ENABLED=1
 export EMA_DECAY=0.997
 export EMA_START_FRAC=0.1
+export EMA_EVERY=10
 
 # Pruning
 export PRUNE_FRACTION=0.03
